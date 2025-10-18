@@ -17,15 +17,25 @@ app.use(
 );
 app.use(express.json());
 
-// ====================== MongoDB Setup ======================
-mongoose.connect(process.env.MONGO_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+// ====================== Debug Environment Variables ======================
+console.log("===== ENV VARIABLES =====");
+console.log("GMAIL_USER:", process.env.GMAIL_USER);
+console.log(
+  "GMAIL_APP_PASSWORD:",
+  process.env.GMAIL_APP_PASSWORD ? "Loaded" : "Not Loaded"
+);
+console.log("MONGO_URI:", process.env.MONGO_URI ? "Loaded" : "Not Loaded");
+console.log("FRONTEND_URL:", process.env.FRONTEND_URL);
+console.log("=========================");
 
-const db = mongoose.connection;
-db.on("error", (err) => console.error("MongoDB connection error:", err));
-db.once("open", () => console.log("✓ Connected to MongoDB"));
+// ====================== MongoDB Setup ======================
+mongoose
+  .connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
+  .then(() => console.log("✓ Connected to MongoDB"))
+  .catch((err) => console.error("MongoDB connection error:", err));
 
 // ====================== Schemas ======================
 const resultSchema = new mongoose.Schema({
@@ -79,6 +89,8 @@ const transporter = nodemailer.createTransport({
     user: GMAIL_CONFIG.user,
     pass: GMAIL_CONFIG.pass,
   },
+  logger: true,
+  debug: true,
 });
 
 // ====================== Inbox Check Logic ======================
@@ -94,7 +106,7 @@ const checkInbox = async (config, testCode) => {
 
     await client.connect();
     const folders = await client.list();
-    console.log(`Checking folders for ${config.email}:`, folders.map(f => f.path));
+    console.log(`Checking folders for ${config.email}:`, folders.map((f) => f.path));
 
     let received = false;
     let folder = "Not Found";
@@ -114,6 +126,7 @@ const checkInbox = async (config, testCode) => {
           break;
         }
       } catch (err) {
+        console.error(`Error opening folder ${folderName}:`, err);
         continue;
       }
     }
@@ -121,7 +134,7 @@ const checkInbox = async (config, testCode) => {
     await client.logout();
     return { received, folder, messageCount };
   } catch (err) {
-    console.error(`Error checking ${config.email}:`, err.message);
+    console.error(`Error checking inbox for ${config.email}:`, err);
     return { received: false, folder: "Error" };
   }
 };
@@ -145,7 +158,14 @@ app.post("/api/tests/create", async (req, res) => {
       testInboxes: [testInbox],
       shareLink: `${process.env.FRONTEND_URL || "http://localhost:3000"}/report/${testCode}`,
     });
-    await test.save();
+
+    try {
+      await test.save();
+      console.log("✓ Test saved to MongoDB:", testCode);
+    } catch (dbErr) {
+      console.error("Error saving test to DB:", dbErr);
+      return res.status(500).json({ message: "DB error: unable to create test", error: dbErr });
+    }
 
     // Send test email
     const mailOptions = {
@@ -155,13 +175,18 @@ app.post("/api/tests/create", async (req, res) => {
       text: `This is a deliverability test email.\n\nTest Code: ${testCode}\nSent from: ${userEmail}`,
     };
 
-    await transporter.sendMail(mailOptions);
-    console.log(`✅ Test email sent to ${testInbox}`);
+    try {
+      await transporter.sendMail(mailOptions);
+      console.log(`✅ Test email sent to ${testInbox}`);
+    } catch (mailErr) {
+      console.error("Error sending email:", mailErr);
+      return res.status(500).json({ message: "Email sending failed", error: mailErr });
+    }
 
-    res.json({ message: "Test created and email sent successfully", testCode, testInbox });
+    res.json({ message: "Test created and email sent successfully", testCode, testInboxes: [testInbox] });
   } catch (err) {
-    console.error("Error creating/sending test:", err.message);
-    res.status(500).json({ message: "Error creating test" });
+    console.error("Error creating test:", err);
+    res.status(500).json({ message: "Unexpected server error", error: err });
   }
 });
 
@@ -191,8 +216,8 @@ app.post("/api/tests/check", async (req, res) => {
       shareLink: test.shareLink,
     });
   } catch (err) {
-    console.error("Error checking results:", err.message);
-    res.status(500).json({ message: "Error checking results" });
+    console.error("Error checking results:", err);
+    res.status(500).json({ message: "Error checking results", error: err });
   }
 });
 
@@ -205,8 +230,36 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`✓ Server running on port ${PORT}`);
   console.log(`✓ Environment: ${process.env.NODE_ENV || "development"}`);
-  console.log(`✓ Frontend URL: ${process.env.FRONTEND_URL}`);
-  console.log(`✓ Mongo URI loaded: ${process.env.MONGO_URI ? "Yes" : "No"}`);
 });
+// 4️⃣ Export Test Results as PDF
+app.get("/api/tests/:testCode/pdf", async (req, res) => {
+  try {
+    const { testCode } = req.params;
+    const test = await Test.findOne({ testCode });
+    if (!test) return res.status(404).json({ message: "Test not found" });
 
-module.exports = app;
+    const doc = new PDFDocument();
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename=report-${testCode}.pdf`);
+
+    doc.fontSize(20).text("Deliverability Report", { align: "center" });
+    doc.moveDown();
+    doc.fontSize(14).text(`Test Code: ${testCode}`);
+    doc.text(`User Email: ${test.userEmail}`);
+    doc.text(`Delivery Score: ${test.deliveryScore}%`);
+    doc.moveDown();
+
+    test.results.forEach((r, i) => {
+      doc.fontSize(12).text(`${i + 1}. Inbox: ${r.inbox}`);
+      doc.text(`   Received: ${r.received ? "Yes" : "No"}`);
+      if (r.received) doc.text(`   Folder: ${r.folder}`);
+      doc.moveDown();
+    });
+
+    doc.end();
+    doc.pipe(res);
+  } catch (err) {
+    console.error("Error generating PDF:", err.message);
+    res.status(500).json({ message: "Error generating PDF" });
+  }
+});
