@@ -200,16 +200,5 @@ inbox-checker/
 
 ---
 
-## 📝 License
+Thank you.
 
-This project is open source and available under the MIT License.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Feel free to open issues and submit pull requests.
-
----
-
-**Built with ❤️ by [Your Name]**
